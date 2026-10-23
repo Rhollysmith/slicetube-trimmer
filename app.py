@@ -2,6 +2,7 @@ import os
 import glob
 import uuid
 import subprocess
+import deno
 import streamlit as st
 
 st.set_page_config(page_title="SliceTube Trimmer", page_icon="✂️", layout="centered")
@@ -13,7 +14,11 @@ os.makedirs(TEMP_DIR, exist_ok=True)
 
 url = st.text_input("Paste YouTube URL:", placeholder="https://www.youtube.com/watch?v=...")
 
-with st.expander("⚙️ Optional: Upload YouTube cookies.txt (if YouTube blocks cloud IP)"):
+with st.expander("⚙️ Optional: Upload YouTube cookies.txt (if YouTube rate-limits Streamlit's IP)"):
+    st.markdown(
+        "If a video still returns `HTTP 403`, install the **Get cookies.txt LOCALLY** browser extension, "
+        "export your YouTube cookies from a private/incognito window, and upload the `.txt` file here."
+    )
     cookie_file = st.file_uploader("Upload cookies.txt (Netscape format)", type=["txt"])
 
 if url:
@@ -35,12 +40,18 @@ if url:
         output_template = os.path.join(TEMP_DIR, f"{clip_id}.%(ext)s")
         final_file = os.path.join(TEMP_DIR, f"{clip_id}.{ext}")
 
-        # Base arguments with JS runtime and working YouTube player clients
+        deno_bin = deno.find_deno_bin()
+
+        # Base command: Force IPv4 (-4), clear stale cache, use Deno JS runtime,
+        # avoid the SABR-broken android client, and pre-check formats to skip 403 streams
         base_cmd = [
             "yt-dlp",
+            "-4",
+            "--rm-cache-dir",
             "--no-playlist",
-            "--js-runtimes", "node",
-            "--extractor-args", "youtube:player_client=android,web,tv,default,-android_vr",
+            "--check-formats",
+            "--js-runtimes", f"deno:{deno_bin}",
+            "--extractor-args", "youtube:player_client=tv,ios,mweb,web_embedded",
         ]
 
         cookie_path = None
@@ -50,25 +61,22 @@ if url:
                 cf.write(cookie_file.read())
             base_cmd += ["--cookies", cookie_path]
 
-        # Force DASH formats so FFmpeg does not fail with code 8 on progressive streams
+        # Use Format Sorting (-S) instead of hard Format Forcing (-f) to avoid PO-Token 403s
         if format_type == "mp3":
-            fmt_args = ["-f", "bestaudio[ext=m4a]/bestaudio", "-x", "--audio-format", "mp3", "--audio-quality", "0"]
+            fmt_args = ["-x", "--audio-format", "mp3", "--audio-quality", "0"]
         else:
-            fmt_str = (
-                f"bestvideo[height<={quality}][vcodec^=avc1]+bestaudio[ext=m4a]/"
-                f"bestvideo[height<={quality}]+bestaudio/bestvideo+bestaudio/best"
-            )
-            fmt_args = ["-f", fmt_str, "--merge-output-format", "mp4"]
+            fmt_args = [
+                "-S", f"res:{quality},vcodec:h264,acodec:m4a,ext:mp4:m4a",
+                "--merge-output-format", "mp4",
+            ]
 
-        # Attempt 1: Fast direct partial-stream slice
         section_arg = f"*{start_time.strip()}-{end_time.strip()}"
         cmd_fast = base_cmd + ["--download-sections", section_arg, "-o", output_template] + fmt_args + [url.strip()]
 
-        with st.spinner("Slicing video stream... Please wait."):
+        with st.spinner("Checking working streams and slicing clip... Please wait."):
             result = subprocess.run(cmd_fast, capture_output=True, text=True)
 
-            # Attempt 2 (Automatic Fallback): If FFmpeg gets HTTP 403 (code 8) on direct range request,
-            # download via yt-dlp's native chunked downloader and trim locally with FFmpeg
+            # Fallback: Download via yt-dlp native downloader and slice locally with FFmpeg
             if result.returncode != 0 or not os.path.exists(final_file):
                 raw_template = os.path.join(TEMP_DIR, f"{clip_id}_raw.%(ext)s")
                 cmd_fallback = base_cmd + ["-o", raw_template] + fmt_args + [url.strip()]
@@ -83,7 +91,7 @@ if url:
                         "-to", end_time.strip(),
                         "-i", raw_file,
                         "-c", "copy",
-                        final_file
+                        final_file,
                     ]
                     subprocess.run(ffmpeg_cmd, capture_output=True, text=True)
                     if os.path.exists(raw_file):
@@ -110,4 +118,4 @@ if url:
             st.error("Failed to trim video.")
             with st.expander("View full error details"):
                 st.code(result.stderr or result.stdout or "Unknown error")
-                
+        
