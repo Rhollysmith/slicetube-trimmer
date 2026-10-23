@@ -1,4 +1,5 @@
 import os
+import glob
 import uuid
 import subprocess
 import streamlit as st
@@ -11,6 +12,9 @@ TEMP_DIR = "/tmp/temp_clips"
 os.makedirs(TEMP_DIR, exist_ok=True)
 
 url = st.text_input("Paste YouTube URL:", placeholder="https://www.youtube.com/watch?v=...")
+
+with st.expander("⚙️ Optional: Upload YouTube cookies.txt (if YouTube blocks cloud IP)"):
+    cookie_file = st.file_uploader("Upload cookies.txt (Netscape format)", type=["txt"])
 
 if url:
     st.video(url)
@@ -31,27 +35,64 @@ if url:
         output_template = os.path.join(TEMP_DIR, f"{clip_id}.%(ext)s")
         final_file = os.path.join(TEMP_DIR, f"{clip_id}.{ext}")
 
-        section_arg = f"*{start_time.strip()}-{end_time.strip()}"
-        cmd = [
+        # Base arguments with JS runtime and working YouTube player clients
+        base_cmd = [
             "yt-dlp",
             "--no-playlist",
-            "--download-sections", section_arg,
-            "--force-keyframes-at-cuts",
-            "-o", output_template,
+            "--js-runtimes", "node",
+            "--extractor-args", "youtube:player_client=android,web,tv,default,-android_vr",
         ]
 
+        cookie_path = None
+        if cookie_file is not None:
+            cookie_path = os.path.join(TEMP_DIR, f"{clip_id}_cookies.txt")
+            with open(cookie_path, "wb") as cf:
+                cf.write(cookie_file.read())
+            base_cmd += ["--cookies", cookie_path]
+
+        # Force DASH formats so FFmpeg does not fail with code 8 on progressive streams
         if format_type == "mp3":
-            cmd += ["-x", "--audio-format", "mp3", "--audio-quality", "0"]
+            fmt_args = ["-f", "bestaudio[ext=m4a]/bestaudio", "-x", "--audio-format", "mp3", "--audio-quality", "0"]
         else:
-            fmt_str = f"bestvideo[height<={quality}][ext=mp4]+bestaudio[ext=m4a]/best[height<={quality}][ext=mp4]/best"
-            cmd += ["-f", fmt_str, "--merge-output-format", "mp4"]
+            fmt_str = (
+                f"bestvideo[height<={quality}][vcodec^=avc1]+bestaudio[ext=m4a]/"
+                f"bestvideo[height<={quality}]+bestaudio/bestvideo+bestaudio/best"
+            )
+            fmt_args = ["-f", fmt_str, "--merge-output-format", "mp4"]
 
-        cmd.append(url.strip())
+        # Attempt 1: Fast direct partial-stream slice
+        section_arg = f"*{start_time.strip()}-{end_time.strip()}"
+        cmd_fast = base_cmd + ["--download-sections", section_arg, "-o", output_template] + fmt_args + [url.strip()]
 
-        with st.spinner("Slicing video stream... Please wait a few seconds."):
-            result = subprocess.run(cmd, capture_output=True, text=True)
+        with st.spinner("Slicing video stream... Please wait."):
+            result = subprocess.run(cmd_fast, capture_output=True, text=True)
 
-        if result.returncode == 0 and os.path.exists(final_file):
+            # Attempt 2 (Automatic Fallback): If FFmpeg gets HTTP 403 (code 8) on direct range request,
+            # download via yt-dlp's native chunked downloader and trim locally with FFmpeg
+            if result.returncode != 0 or not os.path.exists(final_file):
+                raw_template = os.path.join(TEMP_DIR, f"{clip_id}_raw.%(ext)s")
+                cmd_fallback = base_cmd + ["-o", raw_template] + fmt_args + [url.strip()]
+                result = subprocess.run(cmd_fallback, capture_output=True, text=True)
+
+                raw_matches = glob.glob(os.path.join(TEMP_DIR, f"{clip_id}_raw.*"))
+                if result.returncode == 0 and raw_matches:
+                    raw_file = raw_matches[0]
+                    ffmpeg_cmd = [
+                        "ffmpeg", "-y",
+                        "-ss", start_time.strip(),
+                        "-to", end_time.strip(),
+                        "-i", raw_file,
+                        "-c", "copy",
+                        final_file
+                    ]
+                    subprocess.run(ffmpeg_cmd, capture_output=True, text=True)
+                    if os.path.exists(raw_file):
+                        os.remove(raw_file)
+
+        if cookie_path and os.path.exists(cookie_path):
+            os.remove(cookie_path)
+
+        if os.path.exists(final_file):
             with open(final_file, "rb") as f:
                 file_bytes = f.read()
             os.remove(final_file)
@@ -66,5 +107,7 @@ if url:
                 use_container_width=True,
             )
         else:
-            st.error(f"Failed to trim video: {result.stderr.splitlines()[-1] if result.stderr else 'Unknown error'}")
-      
+            st.error("Failed to trim video.")
+            with st.expander("View full error details"):
+                st.code(result.stderr or result.stdout or "Unknown error")
+                
